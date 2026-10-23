@@ -1,19 +1,11 @@
 // Excerpted from the PanelPrep production codebase for hackathon judging.
 
-import { GoogleGenAI } from '@google/genai';
 import { Timestamp, getFirestore } from 'firebase-admin/firestore';
 
 import { config } from './config.js';
-import { getGeminiApiKey } from './secret.js';
+import { genai } from './genai.js';
 
 const TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
-
-let aiClient: GoogleGenAI | null = null;
-async function client(): Promise<GoogleGenAI> {
-  if (aiClient) return aiClient;
-  aiClient = new GoogleGenAI({ apiKey: await getGeminiApiKey() });
-  return aiClient;
-}
 
 function cacheKey(company: string, role?: string, seniority?: string): string {
   return [company, role ?? 'any', seniority ?? 'any']
@@ -50,7 +42,7 @@ interviewer who must mimic ${company}'s REAL process and style: the interview lo
 common question themes with 1–2 concrete example questions, what they evaluate, and the
 signals/rubric they look for. Be factual and current; 150–250 words; plain text.`;
 
-  const ai = await client();
+  const ai = await genai();
   const res = await ai.models.generateContent({
     model: config.parseModel, // gemini-2.5-flash supports Google Search grounding
     contents: prompt,
