@@ -1,12 +1,13 @@
 // Excerpted from the PanelPrep production codebase for hackathon judging.
 
 import { Injectable, inject, signal } from '@angular/core';
-import { FunctionCall, GoogleGenAI, LiveServerMessage, Session } from '@google/genai';
+import type { FunctionCall, LiveServerMessage } from '@google/genai';
 
 import { environment } from '../../../environments/environment';
 import { AuthService } from '../auth/auth.service';
 import { InterviewService } from '../data/interview.service';
 import { AudioPlayer, AudioRecorder } from './audio';
+import { GatewaySession } from './gateway-session';
 
 export type LiveStatus = 'idle' | 'connecting' | 'live' | 'ended' | 'error';
 export type PanelistId = 'lead' | 'peer';
@@ -18,8 +19,9 @@ export interface TranscriptLine {
   name?: string;
 }
 
+/** /token response: one vertex-gateway URL (signed single-use ticket) per chair. */
 interface TokenBundle {
-  sessions: { id: PanelistId; name: string; token: string }[];
+  sessions: { id: PanelistId; name: string; url: string }[];
   model: string;
   kickoff: string;
 }
@@ -28,7 +30,7 @@ interface TokenBundle {
 interface PanelistSession {
   id: PanelistId;
   name: string;
-  session: Session | null;
+  session: GatewaySession | null;
   /** True while the underlying websocket is open and writable. */
   open: boolean;
   /** True once the session is gone for good (idle close, goAway) until revived. */
@@ -48,7 +50,8 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  * receives mic audio; the floor moves when the model calls the `hand_off`
  * tool — the client acks it, syncs the conversation delta into the other
  * session as text, and re-routes the mic. Sessions are revived with a fresh
- * single-use token if they drop while idle.
+ * single-use ticket if they drop while idle. Each session is a plain WebSocket
+ * to the shared vertex-gateway (gateway-session.ts).
  */
 @Injectable()
 export class GeminiLiveService {
@@ -62,6 +65,8 @@ export class GeminiLiveService {
   readonly speaking = signal(false);
   /** Name of the panelist currently speaking (the active session's owner). */
   readonly speakingName = signal<string | null>(null);
+  /** Guest demo only: epoch ms when the broker-enforced time box ends. */
+  readonly demoEndsAt = signal<number | null>(null);
   /** Friendly note when a session ends for an expected reason (e.g. time limit). */
   readonly endedNote = signal<string | null>(null);
   /** True while the candidate's mic is muted (FAB toggle). */
@@ -71,6 +76,8 @@ export class GeminiLiveService {
   private active: PanelistId = 'lead';
   private pendingHandoff: PanelistId | null = null;
   private handoffTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The next turnComplete ends the tool-call turn itself, not the speech after it. */
+  private skipToolTurnComplete = false;
   private model = '';
   private recorderStarted = false;
   /** True once the candidate has spoken since the last handoff — a hand_off is
@@ -103,6 +110,7 @@ export class GeminiLiveService {
     this.muted.set(false);
     this.active = 'lead';
     this.pendingHandoff = null;
+    this.skipToolTurnComplete = false;
     this.candidateSpoke = false;
     this.micHoldUntil = 0;
     this.audioSinceHandoff = true;
@@ -129,8 +137,8 @@ export class GeminiLiveService {
       // The lead must connect (it opens the interview); a peer failure only
       // degrades — the peer is revived with a fresh token at the next handoff.
       await Promise.all([
-        this.openSession('lead', lead.token),
-        peer ? this.openSession('peer', peer.token).catch(() => this.markDead('peer')) : Promise.resolve(),
+        this.openSession('lead', lead.url),
+        peer ? this.openSession('peer', peer.url).catch(() => this.markDead('peer')) : Promise.resolve(),
       ]);
     } catch (err) {
       this.onError(err instanceof Error ? err.message : 'Failed to start the live session.');
@@ -159,12 +167,13 @@ export class GeminiLiveService {
       body: JSON.stringify(panelist ? { interviewId, panelist } : { interviewId }),
     });
     if (!res.ok) {
-      throw new Error(`Token broker returned ${res.status}`);
+      const code = ((await res.json().catch(() => ({}))) as { error?: string }).error;
+      throw new Error(DEMO_ERRORS[code ?? ''] ?? `Token broker returned ${res.status}`);
     }
-    const data = (await res.json()) as Partial<TokenBundle> & { token?: string };
-    // Older broker: single-session response — run lead-only (no handoffs).
-    const sessions =
-      data.sessions?.length ? data.sessions : [{ id: 'lead' as const, name: 'Panel', token: data.token ?? '' }];
+    const data = (await res.json()) as Partial<TokenBundle> & { demoEndsAt?: number };
+    if (data.demoEndsAt) this.demoEndsAt.set(data.demoEndsAt);
+    const sessions = data.sessions ?? [];
+    if (!sessions.length) throw new Error('Token broker returned no sessions.');
     return {
       sessions,
       model: data.model ?? environment.geminiLiveModel,
@@ -172,21 +181,16 @@ export class GeminiLiveService {
     };
   }
 
-  private async openSession(id: PanelistId, token: string): Promise<void> {
+  private async openSession(id: PanelistId, url: string): Promise<void> {
     const state = this.sessions.get(id);
     if (!state) return;
-    const ai = new GoogleGenAI({ apiKey: token, httpOptions: { apiVersion: 'v1alpha' } });
-    state.session = await ai.live.connect({
-      model: this.model,
-      config: {},
-      callbacks: {
-        onopen: () => {
-          state.open = true;
-        },
-        onmessage: (msg) => this.onMessage(id, msg),
-        onerror: (e: ErrorEvent) => this.onSessionError(id, e.message || 'Live session error'),
-        onclose: (ev?: { code?: number; reason?: string }) => this.onClose(id, ev),
+    state.session = await GatewaySession.connect(url, {
+      onopen: () => {
+        state.open = true;
       },
+      onmessage: (msg) => this.onMessage(id, msg),
+      onerror: (e) => this.onSessionError(id, e.message || 'Live session error'),
+      onclose: (ev) => this.onClose(id, ev),
     });
   }
 
@@ -240,6 +244,12 @@ export class GeminiLiveService {
         this.player.enqueue(data);
         this.speaking.set(true);
         this.speakingName.set(state.name);
+        // Still speaking after an accepted hand_off (on Vertex the spoken part
+        // can come as a second turn after the toolResponse): push the fallback.
+        if (this.pendingHandoff && this.handoffTimer) {
+          clearTimeout(this.handoffTimer);
+          this.handoffTimer = setTimeout(() => void this.performHandoff(), 2500);
+        }
         // The floor-holder is audibly present — release the guards.
         this.audioSinceHandoff = true;
         this.micHoldUntil = 0;
@@ -257,6 +267,14 @@ export class GeminiLiveService {
 
     if (content.turnComplete) {
       this.speaking.set(false);
+      // Vertex ends a tool-call turn with turnComplete BEFORE the model's
+      // follow-up turn (sent after our toolResponse). Hand off on the turn
+      // after that one, or on the fallback timer if the model stays silent.
+      if (this.skipToolTurnComplete) {
+        this.skipToolTurnComplete = false;
+        void this.flushTurn();
+        return;
+      }
       void this.completeActiveTurn();
     }
   }
@@ -290,6 +308,7 @@ export class GeminiLiveService {
     }
     if (accept && calls.some((fc) => fc.name === 'hand_off')) {
       this.pendingHandoff = this.other(id);
+      this.skipToolTurnComplete = true;
       // Fallback: if the model never completes its turn after calling the tool
       // (the old dead-air failure mode), hand off anyway.
       this.handoffTimer ??= setTimeout(() => void this.performHandoff(), 2500);
@@ -326,6 +345,7 @@ export class GeminiLiveService {
     if (!to) return;
     const from = this.active;
     this.pendingHandoff = null;
+    this.skipToolTurnComplete = false;
     if (this.handoffTimer) {
       clearTimeout(this.handoffTimer);
       this.handoffTimer = null;
@@ -405,13 +425,13 @@ export class GeminiLiveService {
     const prev = this.sessions.get(id);
     const bundle = await this.fetchTokens(this.interviewId, id);
     const info = bundle.sessions.find((s) => s.id === id);
-    if (!info?.token) throw new Error(`No token for ${id}`);
+    if (!info?.url) throw new Error(`No session ticket for ${id}`);
     const state = this.blankState(id, info.name || prev?.name || 'Panel');
     // The revived session gets the persisted transcript baked into its prompt
     // by the broker; the delta since then travels in the [HANDOFF] nudge.
     state.syncedTo = prev?.syncedTo ?? 0;
     this.sessions.set(id, state);
-    await this.openSession(id, info.token);
+    await this.openSession(id, info.url);
     return state;
   }
 
@@ -602,3 +622,14 @@ export class GeminiLiveService {
     }
   }
 }
+
+/** Broker refusals a guest can hit, in plain words. */
+const DEMO_ERRORS: Record<string, string> = {
+  demo_budget_exhausted:
+    'The free demo is fully booked this month. Sign in with Google to run a full interview instead.',
+  demo_ip_limit: 'This network has used its free demos for today. Sign in with Google to keep practising.',
+  demo_used: 'You have already used your free demo. Sign in with Google to run a full interview.',
+  demo_over: 'Your demo time is up.',
+  demo_disabled: 'The free demo is paused right now. Sign in with Google to run a full interview.',
+  sign_in_required: 'Please sign in with Google to continue.',
+};
