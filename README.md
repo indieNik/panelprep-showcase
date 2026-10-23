@@ -88,6 +88,8 @@ flowchart LR
 
 Security was treated as a first-class feature, not an afterthought:
 
+> **Update, 2026-10-23:** Gemini now runs on Vertex AI. Live voice goes through a shared relay, vertex-gateway: the broker signs a single-use ticket (HS256, about 90 s) carrying the same locked prompt, voice and `hand_off` tool, and the browser opens a plain WebSocket with it ([`client/core/live/gateway-session.ts`](client/core/live/gateway-session.ts), [`server/src/token.ts`](server/src/token.ts)). Where this page says "ephemeral token", read "gateway ticket"; the security properties below still hold, and no API key is used at all.
+
 - **The Gemini API key never leaves the server.** It lives in Secret Manager and is read only by the Cloud Run broker. The browser never sees it — it receives only ephemeral tokens.
 - **Prompts are server-locked.** Each panelist's system prompt, persona, voice, and the `hand_off` tool are built server-side and **baked into the ephemeral token's `liveConnectConstraints`**. The client connects with an *empty* config — it cannot read, override, or jailbreak-edit the prompt. (Verified: prompt strings are absent from the shipped client bundle.)
 - **Tokens are single-use and short-lived**, with a narrow new-session start window. A leaked token is worth one already-configured session at most.

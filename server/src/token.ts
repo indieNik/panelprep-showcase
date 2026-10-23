@@ -1,12 +1,23 @@
 // Excerpted from the PanelPrep production codebase for hackathon judging.
 
-import { GoogleGenAI, Modality, Tool } from '@google/genai';
+import { createHmac, randomUUID } from 'node:crypto';
+
+import type { Tool } from '@google/genai';
 
 import { config } from './config.js';
-import { getGeminiApiKey } from './secret.js';
 
-export interface EphemeralToken {
-  token: string;
+/**
+ * Live voice runs through the shared vertex-gateway (Cloud Run, project
+ * instagram-content-bot-479808; ADR 0002). Vertex AI issues no client-side
+ * ephemeral tokens, so instead of an AI Studio token the broker signs a
+ * short-lived, single-use gateway ticket that carries the FULL Live session
+ * setup (system prompt, voice, transcription, tools). The gateway opens the
+ * Vertex Live session with that setup and drops any setup frame the browser
+ * sends, so the browser can neither read nor override the prompt, as before.
+ */
+export interface LiveTicket {
+  /** wss://<gateway>/live?ticket=<JWT>; one connection, valid for ticketTtlSeconds. */
+  url: string;
   model: string;
 }
 
@@ -15,62 +26,61 @@ export interface SessionConfig {
   voiceName: string;
   /** Optional function declarations (e.g. the panel hand_off tool). */
   tools?: Tool[];
+  /** Hard end (epoch ms) of a guest demo: no ticket is issued after it. */
+  expiresAt?: number;
 }
 
-let aiClient: GoogleGenAI | null = null;
+/** App id registered in the gateway's `vertex-gateway-apps` secret. */
+const GATEWAY_APP = 'panel-prep';
 
-async function client(): Promise<GoogleGenAI> {
-  if (aiClient) return aiClient;
-  const apiKey = await getGeminiApiKey();
-  aiClient = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } });
-  return aiClient;
+const b64url = (data: string | Buffer) => Buffer.from(data).toString('base64url');
+
+/** HS256 JWT, as the gateway verifies it (docs/CLIENTS.md in vertex-gateway). */
+function signTicket(claims: Record<string, unknown>, secret: string): string {
+  const head = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64url(JSON.stringify(claims));
+  const sig = createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+  return `${head}.${body}.${sig}`;
 }
-
-const safeNumber = (v: unknown, fallback: number) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-};
 
 /**
- * Mint a short-lived, single-use ephemeral token with the FULL Live session
- * config baked in (system prompt, voice, transcription, resilience). Because the
- * config lives in the token's liveConnectConstraints, the browser can neither
- * read the prompt nor override it — it connects with an empty config.
+ * Build the Live `setup` in Vertex wire format (camelCase, short model id).
+ * A guest demo gets no context-window compression, so a session that outlives
+ * the demo's client-side time box still ends at the Live API's own audio
+ * session limit instead of running on.
  */
-export async function mintEphemeralToken(session: SessionConfig): Promise<EphemeralToken> {
-  const ai = await client();
-  const now = Date.now();
-  const expireTime = new Date(now + safeNumber(config.tokenTtlMinutes, 30) * 60_000).toISOString();
-  const newSessionExpireTime = new Date(
-    now + safeNumber(config.sessionStartWindowMinutes, 2) * 60_000,
-  ).toISOString();
-
-  const created = await ai.authTokens.create({
-    config: {
-      uses: 1,
-      expireTime,
-      newSessionExpireTime,
-      liveConnectConstraints: {
-        model: config.liveModel,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          systemInstruction: session.systemInstruction,
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: session.voiceName } },
-          },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          contextWindowCompression: { slidingWindow: {} },
-          sessionResumption: {},
-          ...(session.tools ? { tools: session.tools } : {}),
-        },
-      },
-      httpOptions: { apiVersion: 'v1alpha' },
+export function buildLiveSetup(session: SessionConfig, demo = false): Record<string, unknown> {
+  return {
+    model: config.liveModel,
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: session.voiceName } } },
     },
-  });
+    systemInstruction: { parts: [{ text: session.systemInstruction }] },
+    ...(session.tools?.length ? { tools: session.tools } : {}),
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
+    ...(demo ? {} : { contextWindowCompression: { slidingWindow: {} } }),
+  };
+}
 
-  if (!created.name) {
-    throw new Error('Failed to mint ephemeral token');
-  }
-  return { token: created.name, model: config.liveModel };
+/** Sign a single-use gateway ticket for one Live connection. */
+export function mintLiveTicket(session: SessionConfig): LiveTicket {
+  const { secret, url, ticketTtlSeconds } = config.gateway;
+  if (!secret || !url) throw new Error('vertex-gateway is not configured');
+  const nowS = Math.floor(Date.now() / 1000);
+  if (session.expiresAt && session.expiresAt <= Date.now()) throw new Error('session_expired');
+  // The gateway refuses exp more than 120 s ahead.
+  const exp = nowS + Math.min(Math.max(10, ticketTtlSeconds), 110);
+  const ticket = signTicket(
+    {
+      app: GATEWAY_APP,
+      exp,
+      jti: randomUUID(),
+      setup: buildLiveSetup(session, session.expiresAt !== undefined),
+    },
+    secret,
+  );
+  const ws = url.replace(/^http/, 'ws').replace(/\/+$/, '');
+  return { url: `${ws}/live?ticket=${encodeURIComponent(ticket)}`, model: config.liveModel };
 }
